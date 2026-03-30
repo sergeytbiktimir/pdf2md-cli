@@ -164,14 +164,14 @@ def replace_placeholders(md_text, images, images_dir_basename):
 
 # ── Vision model integration ──────────────────────────────────────────────────
 
-def call_vision_model(img_path, vision_url):
+def call_vision_model(img_path, vision_url, model="glm-ocr"):
     """
-    Send an image to a vision model (Ollama or LM Studio / OpenAI-compatible).
-    Returns LaTeX string or None on failure.
+    Send an image to a vision model and return LaTeX string or None on failure.
 
-    Tries:
-    1. OpenAI-compatible  POST /v1/chat/completions
-    2. Ollama native      POST /api/generate  (model: llava)
+    Supports three request formats:
+    1. GLM-OCR format  — image in system message (Ollama /v1/chat/completions)
+    2. Standard vision — image in user message   (LM Studio / Ollama /v1)
+    3. Ollama native   — POST /api/generate with images array
     """
     import base64
     import json
@@ -187,11 +187,52 @@ def call_vision_model(img_path, vision_url):
     )
 
     base_url = vision_url.rstrip('/')
+    is_glm_ocr = "glm-ocr" in model.lower()
 
-    # ── Attempt 1: OpenAI-compatible (LM Studio, Ollama /v1) ──────────────────
+    # ── Format 1: GLM-OCR — image in system message ───────────────────────────
+    if is_glm_ocr:
+        try:
+            payload = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": [
+                            {"type": "text", "text": "OCR"},
+                            {"type": "image_url", "image_url": {
+                                "url": f"data:image/png;base64,{img_b64}"
+                            }},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    },
+                ],
+                "stream": False,
+                "temperature": 0.1,
+            }
+            req = urllib.request.Request(
+                f"{base_url}/v1/chat/completions",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                result = json.loads(resp.read())
+            if "choices" in result:
+                content = result["choices"][0]["message"]["content"].strip()
+                content = re.sub(r'^```(?:latex|math|tex)?\s*', '', content, flags=re.IGNORECASE)
+                content = re.sub(r'\s*```$', '', content)
+                return content.strip()
+        except Exception:
+            pass
+        return None
+
+    # ── Format 2: Standard vision — image in user message ────────────────────
     try:
         payload = {
-            "model": "local-model",
+            "model": model,
             "messages": [{
                 "role": "user",
                 "content": [
@@ -210,21 +251,20 @@ def call_vision_model(img_path, vision_url):
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=45) as resp:
+        with urllib.request.urlopen(req, timeout=60) as resp:
             result = json.loads(resp.read())
         if "choices" in result:
             content = result["choices"][0]["message"]["content"].strip()
-            # Strip any fences the model may have added
             content = re.sub(r'^```(?:latex|math|tex)?\s*', '', content, flags=re.IGNORECASE)
             content = re.sub(r'\s*```$', '', content)
             return content.strip()
     except Exception:
         pass
 
-    # ── Attempt 2: Ollama native format ───────────────────────────────────────
+    # ── Format 3: Ollama native /api/generate ─────────────────────────────────
     try:
         payload = {
-            "model": "llava",
+            "model": model,
             "prompt": prompt,
             "images": [img_b64],
             "stream": False,
@@ -235,7 +275,7 @@ def call_vision_model(img_path, vision_url):
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=45) as resp:
+        with urllib.request.urlopen(req, timeout=60) as resp:
             result = json.loads(resp.read())
         if "response" in result:
             return result["response"].strip()
@@ -245,7 +285,7 @@ def call_vision_model(img_path, vision_url):
     return None
 
 
-def describe_images_with_vision(md_text, images_dir, images_dir_basename, vision_url):
+def describe_images_with_vision(md_text, images_dir, images_dir_basename, vision_url, vision_model="glm-ocr"):
     """
     For each ![...](images_dir_basename/...) reference in the markdown,
     call the vision model and replace the image tag with a $$ LaTeX $$ block.
@@ -264,10 +304,16 @@ def describe_images_with_vision(md_text, images_dir, images_dir_basename, vision
             return match.group(0)
 
         print(f"    [vision] {img_filename} ...", file=sys.stderr)
-        latex = call_vision_model(img_full, vision_url)
+        latex = call_vision_model(img_full, vision_url, vision_model)
 
         if latex:
-            return f"\n$$\n{latex}\n$$\n"
+            # Strip outer $$ fences if model already added them
+            latex_clean = latex.strip()
+            latex_clean = re.sub(r'^\$\$\s*', '', latex_clean)
+            latex_clean = re.sub(r'\s*\$\$$', '', latex_clean)
+            latex_clean = latex_clean.strip()
+            if latex_clean:
+                return f"\n$$\n{latex_clean}\n$$\n"
         return match.group(0)   # keep image if model failed
 
     return img_pattern.sub(replace_with_latex, md_text)
@@ -275,7 +321,7 @@ def describe_images_with_vision(md_text, images_dir, images_dir_basename, vision
 
 # ── Main conversion ───────────────────────────────────────────────────────────
 
-def convert(input_pdf, output_file, fmt, math_mode, vision_url):
+def convert(input_pdf, output_file, fmt, math_mode, vision_url, vision_model="glm-ocr"):
     import pymupdf4llm
     import pymupdf
 
@@ -348,9 +394,9 @@ def convert(input_pdf, output_file, fmt, math_mode, vision_url):
 
         # 4. Optional: send images to vision model for LaTeX description
         if vision_url and n_imgs:
-            print(f"  → Vision mode: {n_imgs} image(s) → {vision_url}",
+            print(f"  → Vision mode: {n_imgs} image(s) → {vision_url} [{vision_model}]",
                   file=sys.stderr)
-            md = describe_images_with_vision(md, images_dir, images_dir_bn, vision_url)
+            md = describe_images_with_vision(md, images_dir, images_dir_bn, vision_url, vision_model)
 
     else:
         # Standard mode — just clean artifacts
@@ -364,20 +410,22 @@ def convert(input_pdf, output_file, fmt, math_mode, vision_url):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    if len(sys.argv) != 6:
+    if len(sys.argv) not in (6, 7):
         print(
-            "Usage: pdf2md_convert.py <input.pdf> <output> <fmt> <math:true|false> <vision_url|>",
+            "Usage: pdf2md_convert.py <input.pdf> <output> <fmt> <math:true|false> <vision_url|> [vision_model]",
             file=sys.stderr
         )
         sys.exit(1)
 
-    _, input_pdf, output_file, fmt, math_flag, vision_url_arg = sys.argv
+    _, input_pdf, output_file, fmt, math_flag, vision_url_arg = sys.argv[:6]
+    vision_model_arg = sys.argv[6] if len(sys.argv) == 7 else "glm-ocr"
 
-    math_mode  = math_flag.lower() == 'true'
-    vision_url = vision_url_arg if vision_url_arg else None
+    math_mode    = math_flag.lower() == 'true'
+    vision_url   = vision_url_arg if vision_url_arg else None
+    vision_model = vision_model_arg if vision_model_arg else "glm-ocr"
 
     try:
-        convert(input_pdf, output_file, fmt, math_mode, vision_url)
+        convert(input_pdf, output_file, fmt, math_mode, vision_url, vision_model)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

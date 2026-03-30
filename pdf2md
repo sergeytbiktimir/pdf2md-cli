@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 SCRIPT_NAME="pdf2md"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -36,7 +36,9 @@ ${BOLD}OPTIONS${NC}
       --format <fmt>     Output format: md (default) or txt
   -m, --math             Math mode: extract formula images, clean OCR artifacts
       --vision-url <url> Vision model URL for LaTeX extraction from formula images
-                         Examples: http://localhost:11434  http://localhost:1234
+                         Examples: http://192.168.1.74:11434  http://localhost:1234
+      --vision-model <m> Vision model name, default: glm-ocr
+                         Examples: glm-ocr  llava  qwen2.5vl:7b  olmocr2
   -f, --force            Overwrite existing output files
   -v, --version          Show version
   -h, --help             Show this help
@@ -54,11 +56,14 @@ ${BOLD}EXAMPLES${NC}
   # Math + OCR for scanned math document
   $SCRIPT_NAME --ocr --math lecture.pdf
 
-  # Math + vision model for LaTeX formula description (Ollama)
-  $SCRIPT_NAME --math --vision-url http://localhost:11434 textbook.pdf
+  # Math + GLM-OCR on remote Ollama server (recommended for formulas)
+  $SCRIPT_NAME --math --vision-url http://192.168.1.74:11434 textbook.pdf
 
-  # Math + vision model (LM Studio)
-  $SCRIPT_NAME --math --vision-url http://localhost:1234 textbook.pdf
+  # Math + specific model name
+  $SCRIPT_NAME --math --vision-url http://192.168.1.74:11434 --vision-model glm-ocr textbook.pdf
+
+  # Math + LM Studio
+  $SCRIPT_NAME --math --vision-url http://localhost:1234 --vision-model olmocr2 textbook.pdf
 
   # Output as plain text
   $SCRIPT_NAME --format txt document.pdf
@@ -124,6 +129,7 @@ convert_file() {
   local fmt="$5"
   local math_mode="$6"
   local vision_url="$7"
+  local vision_model="$8"
 
   if [[ -f "$output" && "$FORCE" != "true" ]]; then
     warn "Skipping (exists): $output  (use --force to overwrite)"
@@ -159,6 +165,7 @@ convert_file() {
     "$fmt" \
     "$math_mode" \
     "$vision_url" \
+    "$vision_model" \
     2>&1 | grep -v "^=== Document parser" | grep -v "^Using Tesseract" | grep -v "^OCR on page" || true
 
   success "  ✓ Saved: $output"
@@ -173,6 +180,7 @@ main() {
   local fmt="md"
   local math_mode="false"
   local vision_url=""
+  local vision_model="glm-ocr"
   FORCE="false"
   local target=""
 
@@ -185,6 +193,7 @@ main() {
          --format)       fmt="$2"; shift 2 ;;
       -m|--math)         math_mode="true"; shift ;;
          --vision-url)   vision_url="$2"; shift 2 ;;
+         --vision-model) vision_model="$2"; shift 2 ;;
       -f|--force)        FORCE="true"; shift ;;
       -v|--version)      echo "pdf2md v${VERSION}"; exit 0 ;;
       -h|--help)         usage; exit 0 ;;
@@ -238,7 +247,7 @@ main() {
     if convert_file \
         "$pdf" "$output" \
         "$use_ocr" "$lang" \
-        "$fmt" "$math_mode" "$vision_url"; then
+        "$fmt" "$math_mode" "$vision_url" "$vision_model"; then
       (( ok++ )) || true
     else
       (( fail++ )) || true
