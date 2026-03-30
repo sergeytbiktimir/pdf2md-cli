@@ -2,17 +2,21 @@
 
 CLI tool to convert PDF files to Markdown optimized for AI/LLM context (RAG, Cursor, ChatGPT, Claude, etc.).
 
-Built on top of [pymupdf4llm](https://github.com/pymupdf/pymupdf4llm) and [ocrmypdf](https://github.com/ocrmypdf/OCRmyPDF). No heavy ML models required. Fits within a 500MB footprint.
+Built on [pymupdf4llm](https://github.com/pymupdf/pymupdf4llm), [ocrmypdf](https://github.com/ocrmypdf/OCRmyPDF), and Tesseract. No heavy ML models required. Fits within a 500MB footprint.
 
 ---
 
 ## Features
 
-- **Variant 1** — text-based PDF → Markdown (preserves headings, bold, structure)
-- **Variant 2** — scanned PDF → OCR → Markdown (via Tesseract + ocrmypdf)
-- Batch processing of entire folders
-- Language flag for OCR (`--lang rus`, `--lang eng`, `--lang rus+eng`)
-- Custom output directory (`--output-dir`)
+| Feature | Flag | Description |
+|---------|------|-------------|
+| Text-based PDF → Markdown | *(default)* | Preserves headings, bold, structure |
+| Scanned PDF → OCR → Markdown | `--ocr` | Via Tesseract + ocrmypdf |
+| Formula images extraction | `--math` | Saves formula images, embeds `![...](path)` in MD |
+| OCR artifact cleanup | `--math` | Removes `~~OO~~`-style noise from OCR output |
+| LaTeX via vision model | `--vision-url` | Sends images to Ollama/LM Studio, replaces with `$$LaTeX$$` |
+| Plain text output | `--format txt` | Raw text without Markdown syntax |
+| Batch folder processing | *(folder path)* | Converts all PDFs in a directory |
 
 ---
 
@@ -33,11 +37,11 @@ chmod +x install.sh
 ./install.sh
 ```
 
-`install.sh` will:
-1. Install `tesseract` + language packs
-2. Install `ocrmypdf`
-3. Install `pymupdf4llm` via pip
-4. Copy `pdf2md` to `/usr/local/bin`
+`install.sh` installs:
+- `tesseract` + language packs
+- `ocrmypdf`
+- `pymupdf4llm` (pip)
+- `pdf2md` CLI + `pdf2md_convert.py` helper
 
 ---
 
@@ -51,10 +55,13 @@ pdf2md [OPTIONS] <file.pdf | folder/>
 
 | Flag | Description |
 |------|-------------|
-| `-o`, `--ocr` | Enable OCR mode (for scanned PDFs) |
+| `-o`, `--ocr` | Enable OCR (for scanned PDFs) |
 | `-l`, `--lang <langs>` | OCR language(s), default: `rus+eng` |
-| `-d`, `--output-dir <dir>` | Output directory for `.md` files |
-| `-f`, `--force` | Overwrite existing `.md` files |
+| `-d`, `--output-dir <dir>` | Output directory for files |
+| `--format md\|txt` | Output format, default: `md` |
+| `-m`, `--math` | Math mode: extract images + clean artifacts |
+| `--vision-url <url>` | Vision model endpoint (enables `--math` automatically) |
+| `-f`, `--force` | Overwrite existing output files |
 | `-v`, `--version` | Show version |
 | `-h`, `--help` | Show help |
 
@@ -62,13 +69,14 @@ pdf2md [OPTIONS] <file.pdf | folder/>
 
 ## Examples
 
-### Single file — text-based PDF (Variant 1)
+### Text-based PDF → Markdown
 
 ```bash
 pdf2md document.pdf
+# → document.md
 ```
 
-**Output** (`document.md`):
+**Output:**
 ```markdown
 ## **Физическая культура**
 
@@ -76,44 +84,73 @@ pdf2md document.pdf
 
 ## **Глоссарий**
 
-**Бег** – один из способов передвижения человека, в котором присутствует
-фаза полёта за счет скоординированных действий мышц скелета, рук и ног.
-
-**Дистанция (спортивная)** – расстояние от старта до финиша, которое
-спортсмен должен преодолеть за максимально короткое время.
+**Бег** – один из способов передвижения человека...
 ```
 
 ---
 
-### Single file — scanned PDF with OCR (Variant 2)
+### Scanned PDF → OCR → Markdown
 
 ```bash
 pdf2md --ocr --lang rus scan.pdf
-```
-
-**Output** (`scan.md`):
-```markdown
-Физическая культура
-
-## Глоссарий
-
-Бег — один из способов передвижения человека, в котором присутствует
-фаза полёта за счет скоординированных действий мышц скелета, рук и ног.
-
-Дистанция (спортивная) — расстояние от старта до финиша, которое
-спортсмен должен преодолеть за максимально короткое время.
+# → scan.md
 ```
 
 ---
 
-### Batch — entire folder
+### Math document (formulas, matrices)
 
 ```bash
-# All PDFs in ./docs/ → .md files saved next to originals
+pdf2md --math textbook.pdf
+# → textbook.md
+# → textbook_images/img_p1_1_abc123.png  (formula images)
+#   textbook_images/img_p2_1_def456.png
+```
+
+**Without `--math`** — formulas embedded as images are lost:
+```markdown
+**==> picture [285 x 37] intentionally omitted <==**
+```
+
+**With `--math`** — formula images are extracted and embedded:
+```markdown
+![Рисунок](textbook_images/img_p2_1_def456.png)
+```
+
+---
+
+### Math + Vision model (LaTeX extraction)
+
+Requires a running vision model (Ollama with `llava`, or LM Studio):
+
+```bash
+# Ollama
+pdf2md --math --vision-url http://localhost:11434 textbook.pdf
+
+# LM Studio
+pdf2md --math --vision-url http://localhost:1234 textbook.pdf
+```
+
+**Output with `--vision-url`** — images replaced by LaTeX:
+```markdown
+$$
+A_{m \times n} = \begin{pmatrix} a_{11} & a_{12} & \cdots & a_{1n} \\ a_{21} & a_{22} & \cdots & a_{2n} \\ \vdots & \vdots & \ddots & \vdots \\ a_{m1} & a_{m2} & \cdots & a_{mn} \end{pmatrix}
+$$
+```
+
+---
+
+### Batch folder
+
+```bash
+# All PDFs → .md files in same directory
 pdf2md ./docs/
 
-# All PDFs with OCR → .md files saved in ./output/
-pdf2md --ocr --output-dir ./output/ ./docs/
+# Math mode, output to ./output/
+pdf2md --math --output-dir ./output/ ./docs/
+
+# OCR + math, plain text output
+pdf2md --ocr --math --format txt ./scans/
 ```
 
 ---
@@ -121,8 +158,14 @@ pdf2md --ocr --output-dir ./output/ ./docs/
 ## How it works
 
 ```
-PDF (text layer)  ──────────────────────────► pymupdf4llm ──► output.md
-PDF (scanned)     ──► ocrmypdf (Tesseract) ──► pymupdf4llm ──► output.md
+PDF (text layer)  ────────────────────────────────► pymupdf4llm ──► output.md
+PDF (scanned)     ──► ocrmypdf (Tesseract OCR) ──► pymupdf4llm ──► output.md
+
+With --math:
+  ├── Extract embedded images ──► output_images/*.png
+  ├── Clean OCR artifacts (~~noise~~)
+  ├── Replace "intentionally omitted" placeholders with ![img](path)
+  └── (optional) --vision-url ──► replace images with $$ LaTeX $$
 ```
 
 ---
@@ -134,9 +177,7 @@ PDF (scanned)     ──► ocrmypdf (Tesseract) ──► pymupdf4llm ──►
 | pymupdf4llm | ~10 MB |
 | ocrmypdf | ~42 MB |
 | tesseract + tesseract-lang | ~130 MB |
-| **Total** | **~180 MB** |
-
-Well within a 500 MB project limit.
+| **Total** | **~182 MB** |
 
 ---
 

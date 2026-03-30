@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="2.0.0"
 SCRIPT_NAME="pdf2md"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -29,33 +29,42 @@ ${BOLD}USAGE${NC}
   $SCRIPT_NAME [OPTIONS] <file.pdf | folder/>
 
 ${BOLD}OPTIONS${NC}
-  -o, --ocr            Use OCR mode (for scanned PDFs without text layer)
-  -l, --lang <langs>   OCR language(s), default: rus+eng
-                       Examples: rus  eng  rus+eng  deu
-  -d, --output-dir     Output directory for output files (default: same as input)
-      --format <fmt>   Output format: md (default) or txt
-  -f, --force          Overwrite existing output files
-  -v, --version        Show version
-  -h, --help           Show this help
+  -o, --ocr              Use OCR mode (for scanned PDFs without text layer)
+  -l, --lang <langs>     OCR language(s), default: rus+eng
+                         Examples: rus  eng  rus+eng  deu
+  -d, --output-dir <dir> Output directory (default: same as input)
+      --format <fmt>     Output format: md (default) or txt
+  -m, --math             Math mode: extract formula images, clean OCR artifacts
+      --vision-url <url> Vision model URL for LaTeX extraction from formula images
+                         Examples: http://localhost:11434  http://localhost:1234
+  -f, --force            Overwrite existing output files
+  -v, --version          Show version
+  -h, --help             Show this help
 
 ${BOLD}EXAMPLES${NC}
-  # Single file (text-based PDF)
+  # Single file — text-based PDF
   $SCRIPT_NAME document.pdf
 
-  # Single file with OCR (scanned PDF)
+  # Single file — scanned PDF with OCR
   $SCRIPT_NAME --ocr scan.pdf
 
-  # OCR with specific language
-  $SCRIPT_NAME --ocr --lang eng invoice.pdf
+  # Math document (formulas, matrices) — extract images, clean artifacts
+  $SCRIPT_NAME --math textbook.pdf
 
-  # Batch: entire folder, OCR mode, output to ./md/
-  $SCRIPT_NAME --ocr --output-dir ./md/ ./pdfs/
+  # Math + OCR for scanned math document
+  $SCRIPT_NAME --ocr --math lecture.pdf
 
-  # Output as plain text instead of Markdown
+  # Math + vision model for LaTeX formula description (Ollama)
+  $SCRIPT_NAME --math --vision-url http://localhost:11434 textbook.pdf
+
+  # Math + vision model (LM Studio)
+  $SCRIPT_NAME --math --vision-url http://localhost:1234 textbook.pdf
+
+  # Output as plain text
   $SCRIPT_NAME --format txt document.pdf
 
-  # OCR + plain text output
-  $SCRIPT_NAME --ocr --format txt scanned.pdf
+  # Batch folder — OCR + math mode, output to ./md/
+  $SCRIPT_NAME --ocr --math --output-dir ./md/ ./pdfs/
 
   # Force overwrite existing results
   $SCRIPT_NAME --force report.pdf
@@ -64,15 +73,31 @@ ${BOLD}REQUIREMENTS${NC}
   - python3 + pymupdf4llm  (always required)
   - tesseract + tesseract-lang  (required for --ocr)
   - ocrmypdf  (required for --ocr)
+  - vision model via Ollama or LM Studio  (optional, for --vision-url)
 
-  Run ${BOLD}pdf2md-install${NC} or see install.sh to set up dependencies.
+  Run ./install.sh to set up all dependencies.
 EOF
+}
+
+# ── Locate Python helper script ───────────────────────────────────────────────
+find_helper() {
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  for candidate in \
+      "$script_dir/pdf2md_convert.py" \
+      "$HOME/.local/lib/pdf2md/pdf2md_convert.py" \
+      "/usr/local/lib/pdf2md/pdf2md_convert.py"; do
+    if [[ -f "$candidate" ]]; then
+      HELPER="$candidate"
+      return
+    fi
+  done
+  error "pdf2md_convert.py not found.\nRe-run install.sh to fix the installation."
 }
 
 # ── Dependency checks ─────────────────────────────────────────────────────────
 check_python() {
-  local py
-  # prefer system Python (has pymupdf4llm installed via pip3)
   for candidate in \
       "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3" \
       "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3" \
@@ -86,7 +111,7 @@ check_python() {
 }
 
 check_ocr_deps() {
-  command -v ocrmypdf >/dev/null 2>&1 || error "ocrmypdf not found.\nRun: brew install ocrmypdf"
+  command -v ocrmypdf  >/dev/null 2>&1 || error "ocrmypdf not found.\nRun: brew install ocrmypdf"
   command -v tesseract >/dev/null 2>&1 || error "tesseract not found.\nRun: brew install tesseract tesseract-lang"
 }
 
@@ -97,9 +122,11 @@ convert_file() {
   local use_ocr="$3"
   local lang="$4"
   local fmt="$5"
+  local math_mode="$6"
+  local vision_url="$7"
 
   if [[ -f "$output" && "$FORCE" != "true" ]]; then
-    warn "Skipping (already exists): $output  (use --force to overwrite)"
+    warn "Skipping (exists): $output  (use --force to overwrite)"
     return
   fi
 
@@ -107,10 +134,11 @@ convert_file() {
 
   local source_pdf="$input"
 
+  # ── OCR pass (optional) ───────────────────────────────────────────────────
   if [[ "$use_ocr" == "true" ]]; then
     local tmp_pdf=""
     tmp_pdf="$(mktemp /tmp/pdf2md_ocr_XXXXXX.pdf)"
-    trap '[[ -n "$tmp_pdf" ]] && rm -f "$tmp_pdf"' RETURN
+    trap '[[ -n "${tmp_pdf:-}" ]] && rm -f "$tmp_pdf"' RETURN
 
     info "  → OCR pass (lang: $lang)..."
     ocrmypdf \
@@ -123,24 +151,15 @@ convert_file() {
     source_pdf="$tmp_pdf"
   fi
 
-  if [[ "$fmt" == "txt" ]]; then
-    info "  → Extracting plain text..."
-    "$PYTHON" - "$source_pdf" "$output" <<'PYEOF'
-import sys, pymupdf
-doc = pymupdf.open(sys.argv[1])
-text = "\n\n".join(page.get_text() for page in doc)
-with open(sys.argv[2], "w", encoding="utf-8") as f:
-    f.write(text)
-PYEOF
-  else
-    info "  → Converting to Markdown..."
-    "$PYTHON" - "$source_pdf" "$output" <<'PYEOF'
-import sys, pymupdf4llm
-md = pymupdf4llm.to_markdown(sys.argv[1])
-with open(sys.argv[2], "w", encoding="utf-8") as f:
-    f.write(md)
-PYEOF
-  fi
+  # ── Python conversion ─────────────────────────────────────────────────────
+  info "  → Converting to ${fmt} (math=${math_mode})..."
+  "$PYTHON" "$HELPER" \
+    "$source_pdf" \
+    "$output" \
+    "$fmt" \
+    "$math_mode" \
+    "$vision_url" \
+    2>&1 | grep -v "^=== Document parser" | grep -v "^Using Tesseract" | grep -v "^OCR on page" || true
 
   success "  ✓ Saved: $output"
 }
@@ -152,29 +171,39 @@ main() {
   local lang="rus+eng"
   local output_dir=""
   local fmt="md"
+  local math_mode="false"
+  local vision_url=""
   FORCE="false"
   local target=""
 
   # parse args
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -o|--ocr)         use_ocr="true"; shift ;;
-      -l|--lang)        lang="$2"; shift 2 ;;
-      -d|--output-dir)  output_dir="$2"; shift 2 ;;
-         --format)      fmt="$2"; shift 2 ;;
-      -f|--force)       FORCE="true"; shift ;;
-      -v|--version)     echo "pdf2md v${VERSION}"; exit 0 ;;
-      -h|--help)        usage; exit 0 ;;
-      -*)               error "Unknown option: $1\nRun '$SCRIPT_NAME --help'" ;;
-      *)                target="$1"; shift ;;
+      -o|--ocr)          use_ocr="true"; shift ;;
+      -l|--lang)         lang="$2"; shift 2 ;;
+      -d|--output-dir)   output_dir="$2"; shift 2 ;;
+         --format)       fmt="$2"; shift 2 ;;
+      -m|--math)         math_mode="true"; shift ;;
+         --vision-url)   vision_url="$2"; shift 2 ;;
+      -f|--force)        FORCE="true"; shift ;;
+      -v|--version)      echo "pdf2md v${VERSION}"; exit 0 ;;
+      -h|--help)         usage; exit 0 ;;
+      -*)                error "Unknown option: $1\nRun '$SCRIPT_NAME --help'" ;;
+      *)                 target="$1"; shift ;;
     esac
   done
 
-  [[ "$fmt" != "md" && "$fmt" != "txt" ]] && error "Invalid format: $fmt. Use: md or txt"
+  [[ "$fmt" != "md" && "$fmt" != "txt" ]] && \
+    error "Invalid format: '$fmt'. Use: md or txt"
+
+  [[ -n "$vision_url" && "$math_mode" != "true" ]] && \
+    warn "--vision-url has no effect without --math; enabling --math automatically" && \
+    math_mode="true"
 
   [[ -z "$target" ]] && { usage; exit 1; }
 
-  # check deps
+  # locate dependencies
+  find_helper
   check_python
   [[ "$use_ocr" == "true" ]] && check_ocr_deps
 
@@ -195,9 +224,8 @@ main() {
   # process
   local ok=0 fail=0
   for pdf in "${files[@]}"; do
-    local dir output
+    local dir base output
     dir="$(dirname "$pdf")"
-    local base
     base="$(basename "$pdf" .pdf)"
 
     if [[ -n "$output_dir" ]]; then
@@ -207,7 +235,10 @@ main() {
       output="${dir}/${base}.${fmt}"
     fi
 
-    if convert_file "$pdf" "$output" "$use_ocr" "$lang" "$fmt"; then
+    if convert_file \
+        "$pdf" "$output" \
+        "$use_ocr" "$lang" \
+        "$fmt" "$math_mode" "$vision_url"; then
       (( ok++ )) || true
     else
       (( fail++ )) || true
