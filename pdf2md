@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+# pdf2md — convert PDF to Markdown optimized for AI/LLM
+# https://github.com/sergeytbiktimir/pdf2md-cli
+
+set -euo pipefail
+
+VERSION="1.0.0"
+SCRIPT_NAME="pdf2md"
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+info()    { echo -e "${CYAN}[pdf2md]${NC} $*"; }
+success() { echo -e "${GREEN}[pdf2md]${NC} $*"; }
+warn()    { echo -e "${YELLOW}[pdf2md]${NC} $*"; }
+error()   { echo -e "${RED}[pdf2md] ERROR:${NC} $*" >&2; exit 1; }
+
+usage() {
+cat <<EOF
+${BOLD}pdf2md v${VERSION}${NC} — PDF to Markdown for AI/LLM
+
+${BOLD}USAGE${NC}
+  $SCRIPT_NAME [OPTIONS] <file.pdf | folder/>
+
+${BOLD}OPTIONS${NC}
+  -o, --ocr            Use OCR mode (for scanned PDFs without text layer)
+  -l, --lang <langs>   OCR language(s), default: rus+eng
+                       Examples: rus  eng  rus+eng  deu
+  -d, --output-dir     Output directory for .md files (default: same as input)
+  -f, --force          Overwrite existing .md files
+  -v, --version        Show version
+  -h, --help           Show this help
+
+${BOLD}EXAMPLES${NC}
+  # Single file (text-based PDF)
+  $SCRIPT_NAME document.pdf
+
+  # Single file with OCR (scanned PDF)
+  $SCRIPT_NAME --ocr scan.pdf
+
+  # OCR with specific language
+  $SCRIPT_NAME --ocr --lang eng invoice.pdf
+
+  # Batch: entire folder, OCR mode, output to ./md/
+  $SCRIPT_NAME --ocr --output-dir ./md/ ./pdfs/
+
+  # Force overwrite existing results
+  $SCRIPT_NAME --force report.pdf
+
+${BOLD}REQUIREMENTS${NC}
+  - python3 + pymupdf4llm  (always required)
+  - tesseract + tesseract-lang  (required for --ocr)
+  - ocrmypdf  (required for --ocr)
+
+  Run ${BOLD}pdf2md-install${NC} or see install.sh to set up dependencies.
+EOF
+}
+
+# ── Dependency checks ─────────────────────────────────────────────────────────
+check_python() {
+  local py
+  # prefer system Python (has pymupdf4llm installed via pip3)
+  for candidate in \
+      "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3" \
+      "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3" \
+      "$(which python3 2>/dev/null || true)"; do
+    if [[ -x "$candidate" ]] && "$candidate" -c "import pymupdf4llm" 2>/dev/null; then
+      PYTHON="$candidate"
+      return
+    fi
+  done
+  error "pymupdf4llm not found.\nRun: pip3 install pymupdf4llm"
+}
+
+check_ocr_deps() {
+  command -v ocrmypdf >/dev/null 2>&1 || error "ocrmypdf not found.\nRun: brew install ocrmypdf"
+  command -v tesseract >/dev/null 2>&1 || error "tesseract not found.\nRun: brew install tesseract tesseract-lang"
+}
+
+# ── Convert single PDF ────────────────────────────────────────────────────────
+convert_file() {
+  local input="$1"
+  local output="$2"
+  local use_ocr="$3"
+  local lang="$4"
+
+  if [[ -f "$output" && "$FORCE" != "true" ]]; then
+    warn "Skipping (already exists): $output  (use --force to overwrite)"
+    return
+  fi
+
+  info "Processing: $(basename "$input")"
+
+  if [[ "$use_ocr" == "true" ]]; then
+    local tmp_pdf
+    tmp_pdf="$(mktemp /tmp/pdf2md_ocr_XXXXXX.pdf)"
+    trap 'rm -f "$tmp_pdf"' RETURN
+
+    info "  → OCR pass (lang: $lang)..."
+    ocrmypdf \
+      --language "$lang" \
+      --force-ocr \
+      --quiet \
+      "$input" "$tmp_pdf" \
+      || error "ocrmypdf failed on: $input"
+
+    info "  → Converting to Markdown..."
+    "$PYTHON" - "$tmp_pdf" "$output" <<'PYEOF'
+import sys, pymupdf4llm
+md = pymupdf4llm.to_markdown(sys.argv[1])
+with open(sys.argv[2], "w", encoding="utf-8") as f:
+    f.write(md)
+PYEOF
+  else
+    info "  → Converting to Markdown..."
+    "$PYTHON" - "$input" "$output" <<'PYEOF'
+import sys, pymupdf4llm
+md = pymupdf4llm.to_markdown(sys.argv[1])
+with open(sys.argv[2], "w", encoding="utf-8") as f:
+    f.write(md)
+PYEOF
+  fi
+
+  success "  ✓ Saved: $output"
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+main() {
+  # defaults
+  local use_ocr="false"
+  local lang="rus+eng"
+  local output_dir=""
+  FORCE="false"
+  local target=""
+
+  # parse args
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|--ocr)         use_ocr="true"; shift ;;
+      -l|--lang)        lang="$2"; shift 2 ;;
+      -d|--output-dir)  output_dir="$2"; shift 2 ;;
+      -f|--force)       FORCE="true"; shift ;;
+      -v|--version)     echo "pdf2md v${VERSION}"; exit 0 ;;
+      -h|--help)        usage; exit 0 ;;
+      -*)               error "Unknown option: $1\nRun '$SCRIPT_NAME --help'" ;;
+      *)                target="$1"; shift ;;
+    esac
+  done
+
+  [[ -z "$target" ]] && { usage; exit 1; }
+
+  # check deps
+  check_python
+  [[ "$use_ocr" == "true" ]] && check_ocr_deps
+
+  # collect PDF files
+  local files=()
+  if [[ -d "$target" ]]; then
+    while IFS= read -r -d '' f; do
+      files+=("$f")
+    done < <(find "$target" -maxdepth 1 -iname "*.pdf" -print0 | sort -z)
+    [[ ${#files[@]} -eq 0 ]] && error "No PDF files found in: $target"
+    info "Found ${#files[@]} PDF file(s) in: $target"
+  elif [[ -f "$target" ]]; then
+    files=("$target")
+  else
+    error "Not a file or directory: $target"
+  fi
+
+  # process
+  local ok=0 fail=0
+  for pdf in "${files[@]}"; do
+    local dir output
+    dir="$(dirname "$pdf")"
+    local base
+    base="$(basename "$pdf" .pdf)"
+
+    if [[ -n "$output_dir" ]]; then
+      mkdir -p "$output_dir"
+      output="${output_dir%/}/${base}.md"
+    else
+      output="${dir}/${base}.md"
+    fi
+
+    if convert_file "$pdf" "$output" "$use_ocr" "$lang"; then
+      (( ok++ )) || true
+    else
+      (( fail++ )) || true
+    fi
+  done
+
+  echo ""
+  success "Done: $ok converted${fail:+, $fail failed}."
+}
+
+main "$@"
