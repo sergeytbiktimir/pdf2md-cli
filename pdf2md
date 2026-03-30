@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 SCRIPT_NAME="pdf2md"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -32,8 +32,9 @@ ${BOLD}OPTIONS${NC}
   -o, --ocr            Use OCR mode (for scanned PDFs without text layer)
   -l, --lang <langs>   OCR language(s), default: rus+eng
                        Examples: rus  eng  rus+eng  deu
-  -d, --output-dir     Output directory for .md files (default: same as input)
-  -f, --force          Overwrite existing .md files
+  -d, --output-dir     Output directory for output files (default: same as input)
+      --format <fmt>   Output format: md (default) or txt
+  -f, --force          Overwrite existing output files
   -v, --version        Show version
   -h, --help           Show this help
 
@@ -49,6 +50,12 @@ ${BOLD}EXAMPLES${NC}
 
   # Batch: entire folder, OCR mode, output to ./md/
   $SCRIPT_NAME --ocr --output-dir ./md/ ./pdfs/
+
+  # Output as plain text instead of Markdown
+  $SCRIPT_NAME --format txt document.pdf
+
+  # OCR + plain text output
+  $SCRIPT_NAME --ocr --format txt scanned.pdf
 
   # Force overwrite existing results
   $SCRIPT_NAME --force report.pdf
@@ -89,6 +96,7 @@ convert_file() {
   local output="$2"
   local use_ocr="$3"
   local lang="$4"
+  local fmt="$5"
 
   if [[ -f "$output" && "$FORCE" != "true" ]]; then
     warn "Skipping (already exists): $output  (use --force to overwrite)"
@@ -97,10 +105,12 @@ convert_file() {
 
   info "Processing: $(basename "$input")"
 
+  local source_pdf="$input"
+
   if [[ "$use_ocr" == "true" ]]; then
-    local tmp_pdf
+    local tmp_pdf=""
     tmp_pdf="$(mktemp /tmp/pdf2md_ocr_XXXXXX.pdf)"
-    trap 'rm -f "$tmp_pdf"' RETURN
+    trap '[[ -n "$tmp_pdf" ]] && rm -f "$tmp_pdf"' RETURN
 
     info "  → OCR pass (lang: $lang)..."
     ocrmypdf \
@@ -110,16 +120,21 @@ convert_file() {
       "$input" "$tmp_pdf" \
       || error "ocrmypdf failed on: $input"
 
-    info "  → Converting to Markdown..."
-    "$PYTHON" - "$tmp_pdf" "$output" <<'PYEOF'
-import sys, pymupdf4llm
-md = pymupdf4llm.to_markdown(sys.argv[1])
+    source_pdf="$tmp_pdf"
+  fi
+
+  if [[ "$fmt" == "txt" ]]; then
+    info "  → Extracting plain text..."
+    "$PYTHON" - "$source_pdf" "$output" <<'PYEOF'
+import sys, pymupdf
+doc = pymupdf.open(sys.argv[1])
+text = "\n\n".join(page.get_text() for page in doc)
 with open(sys.argv[2], "w", encoding="utf-8") as f:
-    f.write(md)
+    f.write(text)
 PYEOF
   else
     info "  → Converting to Markdown..."
-    "$PYTHON" - "$input" "$output" <<'PYEOF'
+    "$PYTHON" - "$source_pdf" "$output" <<'PYEOF'
 import sys, pymupdf4llm
 md = pymupdf4llm.to_markdown(sys.argv[1])
 with open(sys.argv[2], "w", encoding="utf-8") as f:
@@ -136,6 +151,7 @@ main() {
   local use_ocr="false"
   local lang="rus+eng"
   local output_dir=""
+  local fmt="md"
   FORCE="false"
   local target=""
 
@@ -145,6 +161,7 @@ main() {
       -o|--ocr)         use_ocr="true"; shift ;;
       -l|--lang)        lang="$2"; shift 2 ;;
       -d|--output-dir)  output_dir="$2"; shift 2 ;;
+         --format)      fmt="$2"; shift 2 ;;
       -f|--force)       FORCE="true"; shift ;;
       -v|--version)     echo "pdf2md v${VERSION}"; exit 0 ;;
       -h|--help)        usage; exit 0 ;;
@@ -152,6 +169,8 @@ main() {
       *)                target="$1"; shift ;;
     esac
   done
+
+  [[ "$fmt" != "md" && "$fmt" != "txt" ]] && error "Invalid format: $fmt. Use: md or txt"
 
   [[ -z "$target" ]] && { usage; exit 1; }
 
@@ -183,12 +202,12 @@ main() {
 
     if [[ -n "$output_dir" ]]; then
       mkdir -p "$output_dir"
-      output="${output_dir%/}/${base}.md"
+      output="${output_dir%/}/${base}.${fmt}"
     else
-      output="${dir}/${base}.md"
+      output="${dir}/${base}.${fmt}"
     fi
 
-    if convert_file "$pdf" "$output" "$use_ocr" "$lang"; then
+    if convert_file "$pdf" "$output" "$use_ocr" "$lang" "$fmt"; then
       (( ok++ )) || true
     else
       (( fail++ )) || true

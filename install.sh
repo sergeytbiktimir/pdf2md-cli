@@ -22,7 +22,23 @@ install_deps_macos() {
   brew install ocrmypdf
 
   info "Installing pymupdf4llm (Python)..."
-  pip3 install --upgrade pymupdf4llm
+  # Try system Python first (avoids brew PEP 668 restriction)
+  local pip_cmd=""
+  for candidate in \
+      "/Library/Frameworks/Python.framework/Versions/3.12/bin/pip3" \
+      "/Library/Frameworks/Python.framework/Versions/3.11/bin/pip3" \
+      "$(which pip3 2>/dev/null || true)"; do
+    if [[ -x "$candidate" ]]; then
+      pip_cmd="$candidate"
+      break
+    fi
+  done
+
+  if [[ -n "$pip_cmd" ]]; then
+    "$pip_cmd" install --upgrade pymupdf4llm
+  else
+    pip3 install --upgrade --break-system-packages pymupdf4llm
+  fi
 }
 
 install_deps_linux() {
@@ -39,13 +55,30 @@ install_cli() {
   local script_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-  info "Installing pdf2md to $INSTALL_DIR..."
+  # Prefer /usr/local/bin if writable, otherwise fall back to ~/bin
   if [[ -w "$INSTALL_DIR" ]]; then
     cp "$script_dir/pdf2md" "$INSTALL_DIR/pdf2md"
+    chmod +x "$INSTALL_DIR/pdf2md"
+    info "Installed to $INSTALL_DIR/pdf2md"
   else
-    sudo cp "$script_dir/pdf2md" "$INSTALL_DIR/pdf2md"
+    local user_bin="$HOME/bin"
+    mkdir -p "$user_bin"
+    cp "$script_dir/pdf2md" "$user_bin/pdf2md"
+    chmod +x "$user_bin/pdf2md"
+    info "Installed to $user_bin/pdf2md"
+    # Add ~/bin to PATH if not already there
+    local shell_rc=""
+    if [[ "$SHELL" == *"zsh"* ]]; then
+      shell_rc="$HOME/.zshrc"
+    else
+      shell_rc="$HOME/.bashrc"
+    fi
+    if ! grep -q 'export PATH="$HOME/bin:$PATH"' "$shell_rc" 2>/dev/null; then
+      echo 'export PATH="$HOME/bin:$PATH"' >> "$shell_rc"
+      info "Added ~/bin to PATH in $shell_rc"
+      warn "Run: source $shell_rc  (or open a new terminal)"
+    fi
   fi
-  chmod +x "$INSTALL_DIR/pdf2md"
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
