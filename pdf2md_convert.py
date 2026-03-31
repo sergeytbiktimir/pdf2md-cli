@@ -64,6 +64,38 @@ def clean_artifacts(text):
     return text
 
 
+# ── Multiplication asterisk normalizer ───────────────────────────────────────
+
+def normalize_multiplication_asterisks(text):
+    """
+    Replace asterisks used as multiplication signs (digit * digit) with ×.
+
+    Only processes lines outside fenced code blocks and $$ math blocks.
+    Markdown emphasis (*text*), bold (**text**), and list items (* item) are
+    unaffected because those patterns never have digits on both sides of *.
+    """
+    lines = text.split('\n')
+    result = []
+    in_block = False
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('```') or stripped.startswith('$$'):
+            in_block = not in_block
+            result.append(line)
+            continue
+
+        if in_block:
+            result.append(line)
+            continue
+
+        # Only replace when * sits between two digit characters (spaces allowed)
+        line = re.sub(r'(\d)\s*\*\s*(\d)', r'\1×\2', line)
+        result.append(line)
+
+    return '\n'.join(result)
+
+
 # ── Image extractor ───────────────────────────────────────────────────────────
 
 def extract_images(pdf_path, images_dir):
@@ -402,6 +434,8 @@ def convert(input_pdf, output_file, fmt, math_mode, vision_url, vision_model="gl
         # Standard mode — just clean artifacts
         md = pymupdf4llm.to_markdown(input_pdf)
         md = clean_artifacts(md)
+
+    md = normalize_multiplication_asterisks(md)
 
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write(md)
