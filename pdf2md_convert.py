@@ -96,6 +96,56 @@ def normalize_multiplication_asterisks(text):
     return '\n'.join(result)
 
 
+# ── Vision URL normalizer ─────────────────────────────────────────────────────
+
+def normalize_base_url(url: str) -> str:
+    """
+    Strip trailing slash and any accidental /v1 suffix so that callers can
+    safely append /v1/chat/completions without producing /v1/v1/... paths.
+
+    Examples:
+        http://host:11434        → http://host:11434
+        http://host:11434/       → http://host:11434
+        http://host:11434/v1     → http://host:11434
+        http://host:11434/v1/    → http://host:11434
+    """
+    base = url.rstrip('/')
+    if base.endswith('/v1'):
+        base = base[:-3]
+    return base
+
+
+# ── LLM response sanitizer ────────────────────────────────────────────────────
+
+def sanitize_latex_response(text: str) -> str:
+    """
+    Clean a vision-model response down to raw LaTeX content.
+
+    Steps:
+    1. Extract body from a fenced block (```latex / ```tex / ```math / ```) if present.
+    2. Drop lines that look like chatty preamble (start with known filler words).
+    3. Strip surrounding $ or $$ that the model may have added around the whole output.
+    """
+    s = text.strip()
+
+    # Extract body from fenced block if the model returned one
+    m = re.search(r'```(?:latex|tex|math)?\s*(.*?)\s*```', s, flags=re.I | re.S)
+    if m:
+        s = m.group(1).strip()
+
+    # Drop lines that are clearly chatty preamble / postamble
+    filler_prefixes = ('here', 'latex', 'transcription', 'result', 'output', 'formula')
+    lines = [ln.strip() for ln in s.splitlines()]
+    lines = [ln for ln in lines if ln and not ln.lower().startswith(filler_prefixes)]
+    s = '\n'.join(lines).strip()
+
+    # Strip surrounding $$ or $ that wrap the entire response
+    s = re.sub(r'^\$\$\s*(.*?)\s*\$\$$', r'\1', s, flags=re.S).strip()
+    s = re.sub(r'^\$\s*(.*?)\s*\$$',    r'\1', s, flags=re.S).strip()
+
+    return s
+
+
 # ── Image extractor ───────────────────────────────────────────────────────────
 
 def extract_images(pdf_path, images_dir):
@@ -213,12 +263,14 @@ def call_vision_model(img_path, vision_url, model="glm-ocr"):
         img_b64 = base64.b64encode(f.read()).decode()
 
     prompt = (
-        "This image shows a mathematical matrix or formula from a university textbook. "
-        "Transcribe it exactly in LaTeX notation. "
-        "Output only the raw LaTeX code (no explanation, no code fences)."
+        "Transcribe ONLY the mathematical expression(s) from this image into valid LaTeX. "
+        "Return ONLY raw LaTeX content: no explanations, no markdown, no code fences, "
+        "no surrounding $ or $$. "
+        "If there are multiple separate expressions, separate them with one blank line. "
+        "For matrices, use '&' between columns and '\\\\' between rows."
     )
 
-    base_url = vision_url.rstrip('/')
+    base_url = normalize_base_url(vision_url)
     is_glm_ocr = "glm-ocr" in model.lower()
 
     # ── Format 1: GLM-OCR — image in system message ───────────────────────────
@@ -253,10 +305,8 @@ def call_vision_model(img_path, vision_url, model="glm-ocr"):
             with urllib.request.urlopen(req, timeout=60) as resp:
                 result = json.loads(resp.read())
             if "choices" in result:
-                content = result["choices"][0]["message"]["content"].strip()
-                content = re.sub(r'^```(?:latex|math|tex)?\s*', '', content, flags=re.IGNORECASE)
-                content = re.sub(r'\s*```$', '', content)
-                return content.strip()
+                raw = result["choices"][0]["message"]["content"]
+                return sanitize_latex_response(raw) or None
         except Exception:
             pass
         return None
@@ -286,10 +336,8 @@ def call_vision_model(img_path, vision_url, model="glm-ocr"):
         with urllib.request.urlopen(req, timeout=60) as resp:
             result = json.loads(resp.read())
         if "choices" in result:
-            content = result["choices"][0]["message"]["content"].strip()
-            content = re.sub(r'^```(?:latex|math|tex)?\s*', '', content, flags=re.IGNORECASE)
-            content = re.sub(r'\s*```$', '', content)
-            return content.strip()
+            raw = result["choices"][0]["message"]["content"]
+            return sanitize_latex_response(raw) or None
     except Exception:
         pass
 
@@ -310,7 +358,7 @@ def call_vision_model(img_path, vision_url, model="glm-ocr"):
         with urllib.request.urlopen(req, timeout=60) as resp:
             result = json.loads(resp.read())
         if "response" in result:
-            return result["response"].strip()
+            return sanitize_latex_response(result["response"]) or None
     except Exception:
         pass
 
@@ -339,13 +387,13 @@ def describe_images_with_vision(md_text, images_dir, images_dir_basename, vision
         latex = call_vision_model(img_full, vision_url, vision_model)
 
         if latex:
-            # Strip outer $$ fences if model already added them
-            latex_clean = latex.strip()
-            latex_clean = re.sub(r'^\$\$\s*', '', latex_clean)
-            latex_clean = re.sub(r'\s*\$\$$', '', latex_clean)
-            latex_clean = latex_clean.strip()
+            # sanitize_latex_response already ran inside call_vision_model,
+            # but latex may come from a cached / future path — run it once more.
+            latex_clean = sanitize_latex_response(latex)
             if latex_clean:
-                return f"\n$$\n{latex_clean}\n$$\n"
+                # Multiple expressions separated by blank lines → individual blocks
+                chunks = [c.strip() for c in re.split(r'\n\s*\n+', latex_clean) if c.strip()]
+                return "\n\n" + "\n\n".join(f"$$\n{c}\n$$" for c in chunks) + "\n\n"
         return match.group(0)   # keep image if model failed
 
     return img_pattern.sub(replace_with_latex, md_text)
